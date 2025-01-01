@@ -5,65 +5,92 @@ import (
 	"fmt"
 	"log"
 
-	ampq "github.com/rabbitmq/amqp091-go"
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 type SimpleQueueType int
+type Acktype int
 
 const (
-    SimpleQueueDurable SimpleQueueType = iota
-    SimpleQueueTransient
+	SimpleQueueDurable SimpleQueueType = iota
+	SimpleQueueTransient
 )
 
-func DeclareAndBind(conn *ampq.Connection, exchange, queueName, key string, simpleQueueType SimpleQueueType) (*ampq.Channel, ampq.Queue, error) {
-    channel, err := conn.Channel()
-    if err != nil {
-        return nil, ampq.Queue{}, err
-    }
+const (
+	Ack Acktype = iota
+	NackDiscard
+	NackRequeue
+)
 
-    isDurable, autoDelete, isExclusive := false, false, false
-    switch simpleQueueType {
-    case SimpleQueueDurable:
-        isDurable = true
-    case SimpleQueueTransient:
-        autoDelete = true
-        isExclusive = true
-    }
-    queue, err := channel.QueueDeclare(queueName, isDurable, autoDelete, isExclusive, false, nil)
-    if err != nil {
-        return nil, ampq.Queue{}, err
-    }
+func DeclareAndBind(conn *amqp.Connection, exchange, queueName, key string, simpleQueueType SimpleQueueType) (*amqp.Channel, amqp.Queue, error) {
+	channel, err := conn.Channel()
+	if err != nil {
+		return nil, amqp.Queue{}, err
+	}
 
-    err = channel.QueueBind(queueName, key, exchange, false, nil)
-    if err != nil {
-        return nil, ampq.Queue{}, err
-    }
+	isDurable, autoDelete, isExclusive := false, false, false
+	switch simpleQueueType {
+	case SimpleQueueDurable:
+		isDurable = true
+	case SimpleQueueTransient:
+		autoDelete = true
+		isExclusive = true
+	}
 
-    return channel, queue, nil
+	args := amqp.Table{
+		"x-dead-letter-exchange": "peril_dlx",
+	}
+
+	queue, err := channel.QueueDeclare(queueName, isDurable, autoDelete, isExclusive, false, args)
+	if err != nil {
+		return nil, amqp.Queue{}, err
+	}
+
+	err = channel.QueueBind(queueName, key, exchange, false, nil)
+	if err != nil {
+		return nil, amqp.Queue{}, err
+	}
+
+	return channel, queue, nil
 }
 
-func SubscribeJSON[T any](conn *ampq.Connection, exchange, queueName, key string, simpleQueueType SimpleQueueType, handler func(T)) error {
-    channel, _, err := DeclareAndBind(conn, exchange, queueName, key, simpleQueueType)
-    if err != nil {
-        log.Println("Unable to subscribe:", err)
-    }
+func SubscribeJSON[T any](conn *amqp.Connection, exchange, queueName, key string, simpleQueueType SimpleQueueType, handler func(T) Acktype) error {
+	channel, queue, err := DeclareAndBind(conn, exchange, queueName, key, simpleQueueType)
+	if err != nil {
+		return fmt.Errorf("could not declare and bind queue: %v", err)
+	}
 
-    msgChan, err := channel.Consume(queueName, "", false, false, false, false, nil)
-    if err != nil {
-        log.Println("Unable to consume queue:", err)
-    }
+	msgs, err := channel.Consume(queue.Name, "", false, false, false, false, nil)
+	if err != nil {
+		return fmt.Errorf("could not consume messages: %v", err)
+	}
 
-    go func(c <-chan ampq.Delivery) {
-        for msg := range(c) {
-            body := new(T)
-            if err := json.Unmarshal(msg.Body, body); err != nil {
-                fmt.Println("Could not unmarshal message:", err)
-                continue
-            }
-            handler(*body)
-            msg.Ack(false)
-        }
-    }(msgChan)
+	unmarshaller := func(data []byte) (T, error) {
+		var target T
+		err := json.Unmarshal(data, &target)
+		return target, err
+	}
 
-    return nil
+	go func() {
+		defer channel.Close()
+		for msg := range msgs {
+			target, err := unmarshaller(msg.Body)
+			if err != nil {
+				fmt.Printf("could not unmarshal message: %v\n", err)
+				continue
+			}
+			switch handler(target) {
+			case Ack:
+				msg.Ack(false)
+				log.Println("Message acknowleged")
+			case NackRequeue:
+				msg.Nack(false, true)
+				log.Println("NackRequeue")
+			case NackDiscard:
+				msg.Nack(false, false)
+				log.Println("Message Nack and discard")
+			}
+		}
+	}()
+	return nil
 }
